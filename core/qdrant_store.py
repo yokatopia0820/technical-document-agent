@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -67,20 +68,48 @@ class QdrantStore:
             except Exception:
                 pass
 
-    def upsert_chunks(self, chunks: list[dict[str, Any]]) -> int:
+    def upsert_chunks(
+        self,
+        chunks: list[dict[str, Any]],
+        batch_size: int = 64,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> int:
         if not chunks:
             return 0
 
-        vectors = self.embedder.embed(chunk["chunk_text"] for chunk in chunks)
-        points: list[models.PointStruct] = []
-        for chunk, vector in zip(chunks, vectors, strict=False):
-            point_id = chunk.get("point_id") or str(uuid4())
-            chunk["point_id"] = point_id
-            points.append(models.PointStruct(id=point_id, vector=vector, payload=chunk))
+        total = len(chunks)
+        inserted = 0
 
-        self.client.upsert(collection_name=self.collection_name, points=points, wait=True)
-        audit_logger.log("qdrant_upsert", {"collection": self.collection_name, "points": len(points), "mode": settings.qdrant_mode})
-        return len(points)
+        for start in range(0, total, batch_size):
+            batch = chunks[start:start + batch_size]
+            vectors = self.embedder.embed(chunk["chunk_text"] for chunk in batch)
+
+            points: list[models.PointStruct] = []
+            for chunk, vector in zip(batch, vectors, strict=False):
+                point_id = chunk.get("point_id") or str(uuid4())
+                chunk["point_id"] = point_id
+                points.append(models.PointStruct(id=point_id, vector=vector, payload=chunk))
+
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points,
+                wait=True,
+            )
+
+            inserted += len(points)
+
+            if progress_callback:
+                progress_callback(inserted, total, "Qdrant登録中")
+
+        audit_logger.log(
+            "qdrant_upsert",
+            {
+                "collection": self.collection_name,
+                "points": inserted,
+                "mode": settings.qdrant_mode,
+            },
+        )
+        return inserted
 
     def search(self, query: str, tag_filters: dict[str, list[str]] | None = None, limit: int = 12) -> list[SearchHit]:
         vector = self.embedder.embed([query])[0]
@@ -128,8 +157,10 @@ class QdrantStore:
         )
         if not current:
             return
+
         payload = dict(current[0].payload or {})
         current_weight = int(payload.get("favorite_weight", 0))
+
         self.client.set_payload(
             collection_name=self.collection_name,
             points=[point_id],
@@ -138,6 +169,7 @@ class QdrantStore:
                 "favorite_weight": current_weight + 1,
             },
         )
+
         audit_logger.log(
             "favorite_marked",
             {
