@@ -272,9 +272,13 @@ def build_chunks(
         used_backends.append("pymupdf")
 
     if parser_backend in {"docling", "hybrid"}:
+        if progress_callback:
+            progress_callback(1, 1, "Docling構造解析中")
         try:
             chunks.extend(build_docling_chunks(pdf_path, doc_id=doc_id, doc_name=doc_name, ocr_enabled=ocr_enabled))
             used_backends.append("docling")
+            if progress_callback:
+                progress_callback(1, 1, "Docling構造解析完了")
         except Exception as exc:
             audit_logger.log("docling_parse_failed", {"pdf_path": pdf_path, "error": str(exc)})
             if parser_backend == "docling" and not chunks:
