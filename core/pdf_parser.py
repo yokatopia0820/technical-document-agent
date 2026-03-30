@@ -18,7 +18,11 @@ from core.tagging import TaggingEngine
 
 def _extract_headings(page: fitz.Page) -> list[dict[str, Any]]:
     headings: list[dict[str, Any]] = []
-    data = page.get_text("dict")
+    try:
+        data = page.get_text("dict")
+    except Exception:
+        return headings
+
     for block in data.get("blocks", []):
         if block.get("type") != 0:
             continue
@@ -33,6 +37,7 @@ def _extract_headings(page: fitz.Page) -> list[dict[str, Any]]:
             is_bold = any("bold" in str(span.get("font", "")).lower() for span in spans)
             if max_size >= 11 or is_bold:
                 headings.append({"text": text, "size": max_size, "bbox": line.get("bbox")})
+
     headings.sort(key=lambda x: x["size"], reverse=True)
     return headings[:10]
 
@@ -51,7 +56,14 @@ def _get_cell_bbox(table: Any, row_idx: int, col_idx: int) -> list[float] | None
     return None
 
 
-def _table_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, context_text: str, tagger: TaggingEngine) -> list[dict[str, Any]]:
+def _table_chunks(
+    page: fitz.Page,
+    pdf_path: str,
+    doc_id: str,
+    doc_name: str,
+    context_text: str,
+    tagger: TaggingEngine,
+) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
     try:
         table_finder = page.find_tables()
@@ -60,7 +72,11 @@ def _table_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, co
         tables = []
 
     for table_index, table in enumerate(tables):
-        matrix = table.extract() or []
+        try:
+            matrix = table.extract() or []
+        except Exception:
+            matrix = []
+
         if len(matrix) < 2:
             continue
 
@@ -77,7 +93,13 @@ def _table_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, co
                     continue
 
                 col_label = headers[col_idx] if col_idx < len(headers) else f"col_{col_idx}"
-                bbox = _get_cell_bbox(table, row_idx, col_idx) or [float(x) for x in table.bbox]
+                bbox = _get_cell_bbox(table, row_idx, col_idx)
+                if bbox is None:
+                    try:
+                        bbox = [float(x) for x in table.bbox]
+                    except Exception:
+                        bbox = [0.0, 0.0, 0.0, 0.0]
+
                 major_tag, medium_tag, minor_tag = tagger.derive_tags(context_text, row_label, col_label, value)
 
                 payload = {
@@ -103,18 +125,23 @@ def _table_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, co
                     "shorthand_json": {row_label: {col_label: value}},
                 }
 
-                verification = verify_payload_against_pdf(pdf_path, payload)
-                payload["verified"] = verification["verified"]
-                payload["verification_summary"] = verification["verification_summary"]
-                payload["value"] = verification.get("corrected_value") or value
-                payload["shorthand_json"] = {row_label: {col_label: payload["value"]}}
+                try:
+                    verification = verify_payload_against_pdf(pdf_path, payload)
+                    payload["verified"] = verification["verified"]
+                    payload["verification_summary"] = verification["verification_summary"]
+                    payload["value"] = verification.get("corrected_value") or value
+                    payload["shorthand_json"] = {row_label: {col_label: payload["value"]}}
+                except Exception as exc:
+                    payload["verified"] = False
+                    payload["verification_summary"] = f"verify_failed: {exc}"
+
                 payload["chunk_text"] = " | ".join(
                     [
                         context_text,
                         f"{page.number + 1}",
                         row_label,
                         col_label,
-                        payload["value"],
+                        str(payload["value"]),
                         json.dumps(payload["shorthand_json"], ensure_ascii=False),
                     ]
                 )
@@ -123,25 +150,46 @@ def _table_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, co
     return chunks
 
 
-def _text_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, context_text: str, tagger: TaggingEngine) -> list[dict[str, Any]]:
+def _text_chunks(
+    page: fitz.Page,
+    pdf_path: str,
+    doc_id: str,
+    doc_name: str,
+    context_text: str,
+    tagger: TaggingEngine,
+) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
-    data = page.get_text("dict")
+
+    try:
+        data = page.get_text("dict")
+    except Exception:
+        return chunks
 
     for block_index, block in enumerate(data.get("blocks", [])):
         if block.get("type") != 0:
             continue
 
-        text = normalize_text(
-            " ".join(
-                span.get("text", "")
-                for line in block.get("lines", [])
-                for span in line.get("spans", [])
+        try:
+            text = normalize_text(
+                " ".join(
+                    span.get("text", "")
+                    for line in block.get("lines", [])
+                    for span in line.get("spans", [])
+                )
             )
-        )
+        except Exception:
+            continue
+
         if len(text) < 20:
             continue
 
         major_tag, medium_tag, minor_tag = tagger.derive_tags(context_text, text[:200])
+
+        bbox = block.get("bbox") or [0.0, 0.0, 0.0, 0.0]
+        try:
+            bbox = [float(x) for x in bbox]
+        except Exception:
+            bbox = [0.0, 0.0, 0.0, 0.0]
 
         payload = {
             "point_id": str(uuid4()),
@@ -151,7 +199,7 @@ def _text_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, con
             "page_no": page.number + 1,
             "chunk_type": "text_block",
             "block_index": block_index,
-            "bbox": [float(x) for x in block.get("bbox")],
+            "bbox": bbox,
             "row_label": "",
             "col_label": "",
             "value": text[:400],
@@ -171,10 +219,31 @@ def _text_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, con
     return chunks
 
 
-def _ocr_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, context_text: str, tagger: TaggingEngine) -> list[dict[str, Any]]:
+def _ocr_chunks(
+    page: fitz.Page,
+    pdf_path: str,
+    doc_id: str,
+    doc_name: str,
+    context_text: str,
+    tagger: TaggingEngine,
+) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
 
-    for idx, block in enumerate(extract_ocr_blocks(page, lang=settings.ocr_langs)):
+    try:
+        ocr_blocks = extract_ocr_blocks(page, lang=settings.ocr_langs)
+    except Exception as exc:
+        audit_logger.log(
+            "ocr_extract_failed",
+            {
+                "pdf_path": pdf_path,
+                "doc_name": doc_name,
+                "page_no": page.number + 1,
+                "error": str(exc),
+            },
+        )
+        return chunks
+
+    for idx, block in enumerate(ocr_blocks):
         text = normalize_text(block.get("text"))
         if len(text) < 2:
             continue
@@ -224,18 +293,35 @@ def _build_pymupdf_chunks(
         total_pages = len(doc)
 
         for idx, page in enumerate(doc, start=1):
-            headings = _extract_headings(page)
-            context_text = " | ".join(h["text"] for h in headings[:4])
-            native_text = normalize_text(page.get_text("text"))
+            try:
+                headings = _extract_headings(page)
+                context_text = " | ".join(h["text"] for h in headings[:4])
 
-            chunks.extend(_table_chunks(page, pdf_path, doc_id, doc_name, context_text, tagger))
-            chunks.extend(_text_chunks(page, pdf_path, doc_id, doc_name, context_text, tagger))
+                try:
+                    native_text = normalize_text(page.get_text("text"))
+                except Exception:
+                    native_text = ""
 
-            if ocr_enabled and len(native_text) < settings.min_chars_for_native_text:
-                chunks.extend(_ocr_chunks(page, pdf_path, doc_id, doc_name, context_text, tagger))
+                chunks.extend(_table_chunks(page, pdf_path, doc_id, doc_name, context_text, tagger))
+                chunks.extend(_text_chunks(page, pdf_path, doc_id, doc_name, context_text, tagger))
 
-            if progress_callback:
-                progress_callback(idx, total_pages, f"PDF解析中 P.{idx}/{total_pages}")
+                if ocr_enabled and len(native_text) < settings.min_chars_for_native_text:
+                    chunks.extend(_ocr_chunks(page, pdf_path, doc_id, doc_name, context_text, tagger))
+
+            except Exception as exc:
+                audit_logger.log(
+                    "pymupdf_page_failed",
+                    {
+                        "pdf_path": pdf_path,
+                        "doc_id": doc_id,
+                        "doc_name": doc_name,
+                        "page_no": idx,
+                        "error": str(exc),
+                    },
+                )
+            finally:
+                if progress_callback:
+                    progress_callback(idx, total_pages, f"PDF P.{idx}/{total_pages}")
 
         return chunks
     finally:
@@ -273,12 +359,12 @@ def build_chunks(
 
     if parser_backend in {"docling", "hybrid"}:
         if progress_callback:
-            progress_callback(1, 1, "Docling構造解析中")
+            progress_callback(1, 1, "Docling")
         try:
             chunks.extend(build_docling_chunks(pdf_path, doc_id=doc_id, doc_name=doc_name, ocr_enabled=ocr_enabled))
             used_backends.append("docling")
             if progress_callback:
-                progress_callback(1, 1, "Docling構造解析完了")
+                progress_callback(1, 1, "Docling")
         except Exception as exc:
             audit_logger.log("docling_parse_failed", {"pdf_path": pdf_path, "error": str(exc)})
             if parser_backend == "docling" and not chunks:
