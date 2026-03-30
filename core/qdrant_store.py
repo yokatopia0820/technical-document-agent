@@ -1,772 +1,315 @@
 from __future__ import annotations
 
-import io
-from pathlib import Path
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
-import streamlit as st
+from qdrant_client import QdrantClient, models
 
 from core.audit import audit_logger
 from core.config import settings
 from core.embeddings import Embedder
-from core.llm import AnswerEngine
-from core.pdf_parser import build_chunks
-from core.pdf_utils import build_highlighted_pdf_bytes, save_uploaded_pdf
-from core.qdrant_store import QdrantStore
-from core.retriever import TechnicalRetriever
 
 
-class UploadedPDFBuffer(io.BytesIO):
-    def __init__(self, data: bytes, name: str) -> None:
-        super().__init__(data)
-        self.name = name
-        self.type = "application/pdf"
-
-    def getbuffer(self):
-        return memoryview(self.getvalue())
+@dataclass
+class SearchHit:
+    point_id: str
+    score: float
+    payload: dict[str, Any]
 
 
-@st.cache_resource
-def get_services() -> tuple[QdrantStore, TechnicalRetriever]:
-    embedder = Embedder()
-    store = QdrantStore(embedder)
-    retriever = TechnicalRetriever(store, AnswerEngine())
-    return store, retriever
+class QdrantStore:
+    def __init__(self, embedder: Embedder) -> None:
+        self.embedder = embedder
+        self.collection_name = settings.qdrant_collection
 
+        if settings.qdrant_mode == "local":
+            self.client = QdrantClient(path=settings.qdrant_local_path)
+        else:
+            self.client = QdrantClient(
+                url=settings.qdrant_url,
+                api_key=settings.qdrant_api_key,
+                prefer_grpc=False,
+            )
 
-def _inject_ui_styles() -> None:
-    st.markdown(
-        """
-        <style>
-        .block-container {
-            padding-top: 1.6rem;
-            padding-bottom: 1rem;
-        }
+        self.ensure_collection()
 
-        h1, h2, h3 {
-            letter-spacing: -0.01em;
-        }
+    def ensure_collection(self) -> None:
+        collections = [c.name for c in self.client.get_collections().collections]
+        if self.collection_name not in collections:
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=models.VectorParams(
+                    size=self.embedder.dimension,
+                    distance=models.Distance.COSINE,
+                ),
+                on_disk_payload=True,
+            )
 
-        .app-hero {
-            padding: 1.1rem 1.15rem 1rem 1.15rem;
-            border: 1px solid rgba(148, 163, 184, 0.16);
-            border-radius: 18px;
-            background: linear-gradient(180deg, rgba(30, 41, 59, 0.30), rgba(15, 23, 42, 0.10));
-            margin-bottom: 0.95rem;
-        }
+        index_fields = [
+            ("doc_id", models.PayloadSchemaType.KEYWORD),
+            ("doc_name", models.PayloadSchemaType.KEYWORD),
+            ("major_tag", models.PayloadSchemaType.KEYWORD),
+            ("medium_tag", models.PayloadSchemaType.KEYWORD),
+            ("minor_tag", models.PayloadSchemaType.KEYWORD),
+            ("page_no", models.PayloadSchemaType.INTEGER),
+            ("favorite", models.PayloadSchemaType.BOOL),
+            ("favorite_weight", models.PayloadSchemaType.INTEGER),
+            ("verified", models.PayloadSchemaType.BOOL),
+            ("parser_backend", models.PayloadSchemaType.KEYWORD),
+            ("chunk_type", models.PayloadSchemaType.KEYWORD),
+        ]
 
-        .status-card {
-            border: 1px solid rgba(148, 163, 184, 0.20);
-            border-radius: 16px;
-            padding: 0.95rem 1rem;
-            margin: 0.2rem 0 0.8rem 0;
-            background: rgba(15, 23, 42, 0.30);
-        }
+        for field_name, schema in index_fields:
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field_name,
+                    field_schema=schema,
+                )
+            except Exception:
+                pass
 
-        .status-card.is-muted {
-            opacity: 0.72;
-            filter: grayscale(0.18);
-        }
+    def upsert_chunks(
+        self,
+        chunks: list[dict[str, Any]],
+        batch_size: int = 64,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> int:
+        if not chunks:
+            return 0
 
-        .status-title {
-            font-size: 0.95rem;
-            font-weight: 700;
-            margin-bottom: 0.25rem;
-        }
+        total = len(chunks)
+        inserted = 0
 
-        .status-sub {
-            font-size: 0.86rem;
-            color: #cbd5e1;
-            word-break: break-word;
-        }
+        for start in range(0, total, batch_size):
+            batch = chunks[start:start + batch_size]
+            texts = [str(chunk.get("chunk_text", "")) for chunk in batch]
+            vectors = self.embedder.embed(texts)
 
-        .status-icon {
-            font-size: 1.15rem;
-            margin-right: 0.35rem;
-        }
+            if not isinstance(vectors, list):
+                vectors = list(vectors)
 
-        div.stButton > button {
-            border-radius: 12px !important;
-            min-height: 2.75rem;
-            font-weight: 700;
-            transition: all 0.15s ease;
-            outline: none !important;
-            box-shadow: none !important;
-        }
+            points: list[models.PointStruct] = []
 
-        div.stButton > button:hover:not(:disabled) {
-            transform: translateY(-1px);
-            outline: none !important;
-            box-shadow: none !important;
-        }
+            for idx, chunk in enumerate(batch):
+                if idx >= len(vectors):
+                    continue
 
-        div.stButton > button:focus,
-        div.stButton > button:focus-visible,
-        div.stButton > button:active {
-            outline: none !important;
-            box-shadow: none !important;
-        }
+                vector = vectors[idx]
+                point_id = str(chunk.get("point_id") or uuid4())
+                chunk["point_id"] = point_id
 
-        div.stButton > button[kind="primary"],
-        div.stButton > button[data-testid="baseButton-primary"] {
-            background: #ff5a5f !important;
-            color: #ffffff !important;
-            border: 1px solid #ff5a5f !important;
-            outline: none !important;
-            box-shadow: none !important;
-        }
+                points.append(
+                    models.PointStruct(
+                        id=point_id,
+                        vector=vector,
+                        payload=chunk,
+                    )
+                )
 
-        div.stButton > button[kind="primary"]:hover:not(:disabled),
-        div.stButton > button[data-testid="baseButton-primary"]:hover:not(:disabled) {
-            background: #ff474d !important;
-            border: 1px solid #ff474d !important;
-            color: #ffffff !important;
-            outline: none !important;
-            box-shadow: none !important;
-        }
+            if not points:
+                continue
 
-        div.stButton > button[kind="primary"]:focus,
-        div.stButton > button[kind="primary"]:focus-visible,
-        div.stButton > button[kind="primary"]:active,
-        div.stButton > button[data-testid="baseButton-primary"]:focus,
-        div.stButton > button[data-testid="baseButton-primary"]:focus-visible,
-        div.stButton > button[data-testid="baseButton-primary"]:active {
-            background: #ff5a5f !important;
-            border: 1px solid #ff5a5f !important;
-            outline: none !important;
-            box-shadow: none !important;
-        }
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points,
+                wait=True,
+            )
 
-        div.stButton > button:disabled {
-            opacity: 0.55;
-            cursor: not-allowed;
-            transform: none !important;
-            border-color: rgba(148, 163, 184, 0.18) !important;
-            box-shadow: none !important;
-            outline: none !important;
-        }
+            inserted += len(points)
 
-        div.stButton > button:disabled:hover {
-            transform: none !important;
-            border-color: rgba(148, 163, 184, 0.18) !important;
-            box-shadow: none !important;
-            outline: none !important;
-        }
+            if progress_callback:
+                progress_callback(inserted, total, "Qdrant登録中")
 
-        section[data-testid="stFileUploader"] small {
-            display: none !important;
-        }
-
-        section[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"] > div {
-            display: none !important;
-        }
-
-        section[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"]::after {
-            content: "PDFファイルをアップロードしてください";
-            display: block;
-            text-align: center;
-            font-weight: 700;
-            font-size: 1rem;
-            color: #e5e7eb;
-            margin-bottom: 0.25rem;
-        }
-
-        section[data-testid="stFileUploader"] button {
-            font-size: 0 !important;
-        }
-
-        section[data-testid="stFileUploader"] button::after {
-            content: "ファイルを開く";
-            font-size: 0.95rem;
-            font-weight: 700;
-        }
-
-        div[data-testid="stChatInput"] textarea::placeholder {
-            color: #94a3b8;
-        }
-
-        .evidence-card {
-            border: 1px solid rgba(148, 163, 184, 0.18);
-            border-radius: 14px;
-            padding: 0.8rem 0.9rem;
-            margin-bottom: 0.65rem;
-            background: rgba(15, 23, 42, 0.24);
-        }
-
-        .evidence-title {
-            font-weight: 700;
-            margin-bottom: 0.2rem;
-        }
-
-        .helper-note {
-            color: #cbd5e1;
-            font-size: 0.92rem;
-            line-height: 1.65;
-        }
-
-        .settings-help {
-            color: #cbd5e1;
-            font-size: 0.84rem;
-            margin-top: 0.1rem;
-            margin-bottom: 0.5rem;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def _init_state() -> None:
-    defaults = {
-        "messages": [],
-        "pdf_path": None,
-        "doc_name": None,
-        "last_result": None,
-        "highlighted_pdf": None,
-        "preset_prompt": "",
-        "uploaded_pdf_bytes": None,
-        "uploaded_pdf_name": None,
-        "is_processing": False,
-        "uploader_key": 0,
-        "ingest_request": False,
-        "progress_percent": 0,
-        "progress_label": "準備中",
-    }
-    for key, value in defaults.items():
-        st.session_state.setdefault(key, value)
-
-
-def _bump_uploader_key() -> None:
-    st.session_state["uploader_key"] = int(st.session_state.get("uploader_key", 0)) + 1
-
-
-def _clear_staged_upload() -> None:
-    st.session_state["uploaded_pdf_bytes"] = None
-    st.session_state["uploaded_pdf_name"] = None
-    _bump_uploader_key()
-
-
-def _reset_document_state(clear_messages: bool = True) -> None:
-    st.session_state["pdf_path"] = None
-    st.session_state["doc_name"] = None
-    st.session_state["last_result"] = None
-    st.session_state["highlighted_pdf"] = None
-    st.session_state["preset_prompt"] = ""
-    st.session_state["is_processing"] = False
-    st.session_state["ingest_request"] = False
-    st.session_state["progress_percent"] = 0
-    st.session_state["progress_label"] = "準備中"
-    _clear_staged_upload()
-    if clear_messages:
-        st.session_state["messages"] = []
-
-
-def _store_uploaded_pdf_selection(uploaded_pdf) -> None:
-    st.session_state["uploaded_pdf_bytes"] = uploaded_pdf.getvalue()
-    st.session_state["uploaded_pdf_name"] = uploaded_pdf.name
-
-
-def _build_staged_pdf_file() -> UploadedPDFBuffer | None:
-    data = st.session_state.get("uploaded_pdf_bytes")
-    name = st.session_state.get("uploaded_pdf_name")
-    if not data or not name:
-        return None
-    return UploadedPDFBuffer(data=data, name=name)
-
-
-def _render_status_card(title: str, subtext: str = "", icon: str = "📄", muted: bool = False) -> None:
-    css_class = "status-card is-muted" if muted else "status-card"
-    st.markdown(
-        f"""
-        <div class="{css_class}">
-            <div class="status-title"><span class="status-icon">{icon}</span>{title}</div>
-            <div class="status-sub">{subtext}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def _clear_current_pdf_ui() -> None:
-    _reset_document_state(clear_messages=True)
-    st.toast("現在のPDFをクリアしました。")
-    st.rerun()
-
-
-def _delete_current_pdf(store: QdrantStore) -> None:
-    pdf_path = st.session_state.get("pdf_path")
-    doc_name = st.session_state.get("doc_name")
-    doc_id = Path(pdf_path).stem if pdf_path else None
-
-    if not doc_name and not doc_id:
-        st.warning("削除するPDFが見つかりません。")
-        return
-
-    deleted_points = 0
-    try:
-        deleted_points = store.delete_document(doc_name=doc_name, doc_id=doc_id)
-    except Exception as exc:
         audit_logger.log(
-            "document_delete_failed",
+            "qdrant_upsert",
             {
+                "collection": self.collection_name,
+                "points": inserted,
+                "mode": settings.qdrant_mode,
+            },
+        )
+        return inserted
+
+    def search(
+        self,
+        query: str,
+        tag_filters: dict[str, list[str]] | None = None,
+        limit: int = 12,
+    ) -> list[SearchHit]:
+        vector = self.embedder.embed([query])[0]
+        query_filter = self._build_filter(tag_filters or {})
+
+        raw_points = None
+
+        if hasattr(self.client, "query_points"):
+            response = self.client.query_points(
+                collection_name=self.collection_name,
+                query=vector,
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+            raw_points = getattr(response, "points", response)
+
+        elif hasattr(self.client, "search"):
+            raw_points = self.client.search(
+                collection_name=self.collection_name,
+                query_vector=vector,
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+
+        else:
+            raise AttributeError("Qdrant client に検索APIが見つかりません。")
+
+        hits: list[SearchHit] = []
+
+        for point in raw_points or []:
+            payload = dict(getattr(point, "payload", {}) or {})
+            score = float(getattr(point, "score", 0.0) or 0.0)
+            point_id = str(getattr(point, "id", ""))
+
+            hits.append(
+                SearchHit(
+                    point_id=point_id,
+                    score=score,
+                    payload=payload,
+                )
+            )
+
+        return hits
+
+    def _build_filter(self, tag_filters: dict[str, list[str]]) -> models.Filter | None:
+        must_conditions: list[models.Condition] = []
+
+        for key in ("major_tag", "medium_tag", "minor_tag", "doc_id", "doc_name", "parser_backend", "chunk_type"):
+            values = [v for v in tag_filters.get(key, []) if v]
+            if not values:
+                continue
+
+            must_conditions.append(
+                models.FieldCondition(
+                    key=key,
+                    match=models.MatchAny(any=values),
+                )
+            )
+
+        page_range = tag_filters.get("page_range", [])
+        if len(page_range) == 2:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="page_no",
+                    range=models.Range(
+                        gte=int(page_range[0]),
+                        lte=int(page_range[1]),
+                    ),
+                )
+            )
+
+        if not must_conditions:
+            return None
+
+        return models.Filter(must=must_conditions)
+
+    def _document_filter(self, doc_name: str | None = None, doc_id: str | None = None) -> models.Filter:
+        must_conditions: list[models.Condition] = []
+
+        if doc_name:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="doc_name",
+                    match=models.MatchValue(value=doc_name),
+                )
+            )
+
+        if doc_id:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="doc_id",
+                    match=models.MatchValue(value=doc_id),
+                )
+            )
+
+        if not must_conditions:
+            raise ValueError("doc_name または doc_id の少なくとも一方が必要です。")
+
+        return models.Filter(must=must_conditions)
+
+    def count_document_points(self, doc_name: str | None = None, doc_id: str | None = None) -> int:
+        doc_filter = self._document_filter(doc_name=doc_name, doc_id=doc_id)
+        result = self.client.count(
+            collection_name=self.collection_name,
+            count_filter=doc_filter,
+            exact=True,
+        )
+        return int(getattr(result, "count", 0))
+
+    def delete_document(self, doc_name: str | None = None, doc_id: str | None = None) -> int:
+        doc_filter = self._document_filter(doc_name=doc_name, doc_id=doc_id)
+        count_before = self.count_document_points(doc_name=doc_name, doc_id=doc_id)
+
+        if count_before == 0:
+            audit_logger.log(
+                "document_delete_skipped",
+                {
+                    "collection": self.collection_name,
+                    "doc_name": doc_name,
+                    "doc_id": doc_id,
+                    "reason": "no_matching_points",
+                },
+            )
+            return 0
+
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=models.FilterSelector(filter=doc_filter),
+            wait=True,
+        )
+
+        audit_logger.log(
+            "document_deleted",
+            {
+                "collection": self.collection_name,
                 "doc_name": doc_name,
                 "doc_id": doc_id,
-                "error": str(exc),
+                "deleted_points": count_before,
+                "mode": settings.qdrant_mode,
             },
         )
+        return count_before
 
-    file_deleted = False
-    if pdf_path:
-        try:
-            path_obj = Path(pdf_path)
-            if path_obj.exists():
-                path_obj.unlink()
-                file_deleted = True
-        except Exception:
-            file_deleted = False
-
-    audit_logger.log(
-        "pdf_deleted_from_ui",
-        {
-            "doc_name": doc_name,
-            "doc_id": doc_id,
-            "pdf_path": pdf_path,
-            "deleted_points": deleted_points,
-            "file_deleted": file_deleted,
-        },
-    )
-
-    _reset_document_state(clear_messages=True)
-    st.toast(f"PDFを削除しました（削除対象: {deleted_points}件）。")
-    st.rerun()
-
-
-def _favorite_button(store: QdrantStore, result: dict[str, Any]) -> None:
-    top_hit = result.get("top_hit")
-    if not top_hit:
-        return
-
-    point_id = top_hit.get("point_id")
-    if not point_id:
-        return
-
-    if st.button("この回答を優先表示する", key=f"fav-{point_id}", use_container_width=True):
-        try:
-            store.mark_favorite(point_id)
-            st.toast("次回からこの回答を優先しやすくしました。")
-        except Exception as exc:
-            audit_logger.log("favorite_mark_failed", {"point_id": point_id, "error": str(exc)})
-            st.warning("優先表示の保存に失敗しました。")
-
-
-def _render_answer_evidence(result: dict[str, Any]) -> None:
-    hits = result.get("hits", []) or []
-    if not hits:
-        return
-
-    with st.expander("回答の根拠を見る", expanded=False):
-        for idx, hit in enumerate(hits[:4], start=1):
-            page_no = hit.get("page_no", "-")
-            verified = "確認済み" if hit.get("verified") else "要確認"
-
-            row_label = str(hit.get("row_label") or "").strip()
-            col_label = str(hit.get("col_label") or "").strip()
-            value = str(hit.get("value") or "").strip()
-
-            if row_label and col_label and value:
-                summary = f"{row_label} / {col_label} / {value}"
-            elif value:
-                summary = value
-            else:
-                summary = "該当箇所の要約を表示できませんでした。"
-
-            st.markdown(
-                f"""
-                <div class="evidence-card">
-                    <div class="evidence-title">{idx}. ページ {page_no} ・ {verified}</div>
-                    <div>{summary}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-
-def _render_pdf_panel() -> None:
-    st.subheader("現在のPDF")
-
-    current_doc_name = st.session_state.get("doc_name")
-    pdf_path = st.session_state.get("pdf_path")
-    highlighted_pdf = st.session_state.get("highlighted_pdf")
-
-    if current_doc_name:
-        st.caption(current_doc_name)
-    else:
-        st.info("まだPDFが読み込まれていません。左側からPDFをアップロードしてください。")
-        return
-
-    pdf_bytes: bytes | None = None
-
-    if highlighted_pdf:
-        pdf_bytes = highlighted_pdf
-        st.caption("参照箇所がある場合は、ハイライト表示します。")
-    elif pdf_path and Path(pdf_path).exists():
-        try:
-            pdf_bytes = Path(pdf_path).read_bytes()
-        except Exception:
-            pdf_bytes = None
-
-    if pdf_bytes:
-        try:
-            st.pdf(pdf_bytes)
-        except Exception:
-            st.download_button(
-                "PDFをダウンロード",
-                data=pdf_bytes,
-                file_name=current_doc_name,
-                mime="application/pdf",
-                use_container_width=True,
-            )
-    else:
-        st.warning("PDF表示の準備に失敗しました。")
-
-    result = st.session_state.get("last_result")
-    top_hit = result.get("top_hit") if result else None
-    if top_hit:
-        st.divider()
-        st.markdown("**参照した箇所**")
-        st.write(f"ページ: P.{top_hit.get('page_no', '-')}")
-        if top_hit.get("value"):
-            st.write(f"内容: {top_hit.get('value')}")
-
-
-def _render_demo_queries(disabled: bool) -> None:
-    demo_queries = [
-        "このPDFの要点を3つで教えてください",
-        "重要な注意点を教えてください",
-        "手順があれば順番に教えてください",
-        "期限や条件に関する記載を探してください",
-        "費用や料金に関する記載を探してください",
-        "問い合わせ先や連絡先があれば教えてください",
-    ]
-
-    st.markdown("**質問例**")
-    cols = st.columns(2)
-    for idx, query in enumerate(demo_queries):
-        with cols[idx % 2]:
-            if st.button(query, key=f"demo-{idx}", use_container_width=True, disabled=disabled):
-                st.session_state["preset_prompt"] = query
-                st.rerun()
-
-
-def _set_progress(progress_host, percent: int, label: str) -> None:
-    percent = max(0, min(100, int(percent)))
-    st.session_state["progress_percent"] = percent
-    st.session_state["progress_label"] = label
-    progress_host.progress(percent, text=f"{percent}% | {label}")
-
-
-def _ingest_uploaded_pdf(
-    store: QdrantStore,
-    uploaded_pdf,
-    parser_backend: str,
-    ocr_enabled: bool,
-    progress_host,
-) -> None:
-    st.session_state["last_result"] = None
-    st.session_state["highlighted_pdf"] = None
-
-    try:
-        _set_progress(progress_host, 0, "準備中")
-
-        pdf_path = save_uploaded_pdf(uploaded_pdf, settings.temp_dir)
-        st.session_state["pdf_path"] = pdf_path
-        st.session_state["doc_name"] = uploaded_pdf.name
-
-        def on_parse_progress(done: int, total: int, stage: str) -> None:
-            total = max(total, 1)
-            percent = min(80, int(done / total * 80))
-            _set_progress(progress_host, percent, stage)
-
-        def on_upsert_progress(done: int, total: int, stage: str) -> None:
-            total = max(total, 1)
-            percent = 80 + min(20, int(done / total * 20))
-            _set_progress(progress_host, percent, stage)
-
-        _set_progress(progress_host, 5, "ファイル保存完了")
-
-        chunks = build_chunks(
-            pdf_path=pdf_path,
-            doc_id=Path(pdf_path).stem,
-            doc_name=uploaded_pdf.name,
-            parser_backend=parser_backend,
-            ocr_enabled=ocr_enabled,
-            progress_callback=on_parse_progress,
+    def mark_favorite(self, point_id: str) -> None:
+        current = self.client.retrieve(
+            collection_name=self.collection_name,
+            ids=[point_id],
+            with_payload=True,
         )
+        if not current:
+            return
 
-        _set_progress(progress_host, 80, "登録準備")
+        payload = dict(current[0].payload or {})
+        current_weight = int(payload.get("favorite_weight", 0))
 
-        inserted = store.upsert_chunks(
-            chunks,
-            batch_size=64,
-            progress_callback=on_upsert_progress,
+        self.client.set_payload(
+            collection_name=self.collection_name,
+            points=[point_id],
+            payload={
+                "favorite": True,
+                "favorite_weight": current_weight + 1,
+            },
         )
 
         audit_logger.log(
-            "pdf_ingest_completed",
+            "favorite_marked",
             {
-                "doc_name": uploaded_pdf.name,
-                "pdf_path": pdf_path,
-                "chunks": len(chunks),
-                "inserted": inserted,
-                "parser_backend": parser_backend,
-                "ocr_enabled": ocr_enabled,
+                "collection": self.collection_name,
+                "point_id": point_id,
+                "favorite_weight": current_weight + 1,
+                "doc_name": payload.get("doc_name"),
+                "page_no": payload.get("page_no"),
             },
         )
-
-        _set_progress(progress_host, 100, "完了")
-        _clear_staged_upload()
-
-    except Exception as exc:
-        audit_logger.log(
-            "pdf_ingest_failed",
-            {
-                "doc_name": getattr(uploaded_pdf, "name", None),
-                "error": str(exc),
-            },
-        )
-        st.session_state["is_processing"] = False
-        st.session_state["ingest_request"] = False
-        st.error("PDFの読込中にエラーが発生しました。ログを確認してください。")
-        raise
-
-    finally:
-        st.session_state["is_processing"] = False
-        st.session_state["ingest_request"] = False
-
-
-def _render_settings_popover(default_backend: str, default_ocr_enabled: bool) -> tuple[str, bool]:
-    parser_backend = default_backend
-    ocr_enabled = default_ocr_enabled
-
-    backends = ["auto", "pymupdf", "hybrid", "docling"]
-    selected_backend = default_backend if default_backend in backends else "auto"
-
-    with st.sidebar:
-        if hasattr(st, "popover"):
-            with st.popover("⚙️ 設定", use_container_width=True):
-                st.markdown('<div class="settings-help">必要なときだけ変更してください。</div>', unsafe_allow_html=True)
-                parser_backend = st.selectbox(
-                    "読取方式",
-                    backends,
-                    index=backends.index(selected_backend),
-                    help="通常は変更不要です。",
-                )
-                ocr_enabled = st.toggle(
-                    "画像内の文字も読む",
-                    value=default_ocr_enabled,
-                    help="スキャンPDFや画像文字が含まれる場合に使います。",
-                )
-        else:
-            with st.expander("⚙️ 設定", expanded=False):
-                st.markdown('<div class="settings-help">必要なときだけ変更してください。</div>', unsafe_allow_html=True)
-                parser_backend = st.selectbox(
-                    "読取方式",
-                    backends,
-                    index=backends.index(selected_backend),
-                    help="通常は変更不要です。",
-                )
-                ocr_enabled = st.toggle(
-                    "画像内の文字も読む",
-                    value=default_ocr_enabled,
-                    help="スキャンPDFや画像文字が含まれる場合に使います。",
-                )
-
-    return parser_backend, ocr_enabled
-
-
-def _render_sidebar(store: QdrantStore) -> tuple[str, bool, Any]:
-    staged_name = st.session_state.get("uploaded_pdf_name")
-    current_doc_name = st.session_state.get("doc_name")
-    is_processing = bool(st.session_state.get("is_processing"))
-
-    parser_backend, ocr_enabled = _render_settings_popover(
-        default_backend=settings.parser_backend,
-        default_ocr_enabled=settings.ocr_enabled,
-    )
-
-    st.sidebar.markdown("### PDFを準備")
-    st.sidebar.caption("PDFを選んでから『読込開始』を押してください。")
-
-    st.sidebar.markdown("**1. アップロード**")
-
-    if not staged_name and not current_doc_name and not is_processing:
-        uploaded_pdf = st.sidebar.file_uploader(
-            "PDFファイルをアップロードしてください",
-            type=["pdf"],
-            key=f"pdf_uploader_{st.session_state.get('uploader_key', 0)}",
-            label_visibility="collapsed",
-        )
-        if uploaded_pdf is not None:
-            _store_uploaded_pdf_selection(uploaded_pdf)
-            st.rerun()
-    else:
-        card_name = staged_name or current_doc_name or "PDFファイル"
-        card_label = "アップロードOK"
-        _render_status_card(card_label, card_name, icon="📎", muted=True)
-
-    st.sidebar.markdown("**2. 読込**")
-
-    can_start = bool(staged_name) and not is_processing and not current_doc_name
-    start_help = None
-    if current_doc_name:
-        start_help = "すでに読み込み済みです。差し替える場合は下のボタンを使ってください。"
-    elif not staged_name:
-        start_help = "先にPDFをアップロードしてください。"
-
-    if st.sidebar.button("読込開始", use_container_width=True, disabled=not can_start, help=start_help, type="primary"):
-        st.session_state["is_processing"] = True
-        st.session_state["ingest_request"] = True
-        st.session_state["progress_percent"] = 0
-        st.session_state["progress_label"] = "準備中"
-        st.rerun()
-
-    progress_host = st.sidebar.empty()
-    progress_percent = int(st.session_state.get("progress_percent", 0))
-    progress_label = str(st.session_state.get("progress_label", "準備中"))
-
-    if is_processing or progress_percent > 0:
-        progress_host.progress(progress_percent, text=f"{progress_percent}% | {progress_label}")
-
-    st.sidebar.divider()
-    st.sidebar.markdown("**現在のPDF**")
-
-    if current_doc_name:
-        _render_status_card("アップロードOK", current_doc_name, icon="📄", muted=True)
-        col1, col2 = st.sidebar.columns(2)
-        with col1:
-            if st.button("差し替える", use_container_width=True, disabled=is_processing):
-                _clear_current_pdf_ui()
-        with col2:
-            if st.button("削除する", use_container_width=True, disabled=is_processing):
-                _delete_current_pdf(store)
-    elif staged_name and not is_processing:
-        _render_status_card("アップロードOK", staged_name, icon="📎", muted=True)
-        if st.sidebar.button("選び直す", use_container_width=True):
-            _clear_staged_upload()
-            st.rerun()
-    else:
-        st.sidebar.info("まだPDFはセットされていません。")
-
-    return parser_backend, ocr_enabled, progress_host
-
-
-def main() -> None:
-    st.set_page_config(page_title="PDFに質問", page_icon="📄", layout="wide")
-    _inject_ui_styles()
-    _init_state()
-
-    store, retriever = get_services()
-    parser_backend, ocr_enabled, progress_host = _render_sidebar(store)
-
-    if st.session_state.get("ingest_request") and st.session_state.get("is_processing"):
-        staged_file = _build_staged_pdf_file()
-        if staged_file is not None:
-            _ingest_uploaded_pdf(
-                store=store,
-                uploaded_pdf=staged_file,
-                parser_backend=parser_backend,
-                ocr_enabled=ocr_enabled,
-                progress_host=progress_host,
-            )
-            st.rerun()
-
-    col1, col2 = st.columns([1.02, 0.98], gap="large")
-
-    with col1:
-        st.markdown(
-            """
-            <div class="app-hero">
-                <h1 style="margin:0 0 0.35rem 0;">PDFに質問</h1>
-                <div class="helper-note">
-                    PDFを読み込むと、内容について質問できます。<br>
-                    回答には、参照したページや該当箇所もあわせて表示します。
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        current_doc_name = st.session_state.get("doc_name")
-        is_processing = bool(st.session_state.get("is_processing"))
-
-        if current_doc_name:
-            st.caption(f"現在のPDF: {current_doc_name}")
-        else:
-            st.info("左側でPDFをアップロードして『読込開始』を押してください。")
-
-        _render_demo_queries(disabled=(not current_doc_name or is_processing))
-
-        for msg in st.session_state["messages"]:
-            with st.chat_message(msg["role"]):
-                st.write(msg["content"])
-
-        chat_disabled = not current_doc_name or is_processing
-        chat_placeholder = "PDFについて質問してください"
-        if is_processing:
-            percent = int(st.session_state.get("progress_percent", 0))
-            chat_placeholder = f"進捗 {percent}%"
-        elif not current_doc_name:
-            chat_placeholder = "先にPDFを読み込んでください"
-
-        prompt = st.chat_input(chat_placeholder, disabled=chat_disabled)
-
-        if not prompt and st.session_state.get("preset_prompt") and not chat_disabled:
-            prompt = st.session_state["preset_prompt"]
-            st.session_state["preset_prompt"] = ""
-
-        if prompt:
-            st.session_state["messages"].append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.write(prompt)
-
-            try:
-                result = retriever.answer(prompt, doc_name=st.session_state.get("doc_name"))
-                st.session_state["last_result"] = result
-
-                top_hit = result.get("top_hit")
-                if top_hit and top_hit.get("source_pdf_path"):
-                    try:
-                        st.session_state["highlighted_pdf"] = build_highlighted_pdf_bytes(
-                            top_hit["source_pdf_path"],
-                            top_hit,
-                        )
-                    except Exception as exc:
-                        audit_logger.log("highlight_pdf_failed", {"error": str(exc)})
-
-                with st.chat_message("assistant"):
-                    st.write(result.get("answer", "回答を生成できませんでした。"))
-                    _render_answer_evidence(result)
-                    _favorite_button(store, result)
-
-                st.session_state["messages"].append(
-                    {"role": "assistant", "content": result.get("answer", "")}
-                )
-
-            except Exception as exc:
-                audit_logger.log(
-                    "chat_query_failed",
-                    {
-                        "query": prompt,
-                        "doc_name": st.session_state.get("doc_name"),
-                        "error": str(exc),
-                    },
-                )
-                with st.chat_message("assistant"):
-                    st.error("検索中にエラーが発生しました。管理画面のログを確認してください。")
-
-    with col2:
-        _render_pdf_panel()
-
-
-if __name__ == "__main__":
-    main()
