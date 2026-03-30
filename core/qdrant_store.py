@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -68,48 +67,27 @@ class QdrantStore:
             except Exception:
                 pass
 
-    def upsert_chunks(
-        self,
-        chunks: list[dict[str, Any]],
-        batch_size: int = 64,
-        progress_callback: Callable[[int, int, str], None] | None = None,
-    ) -> int:
+    def upsert_chunks(self, chunks: list[dict[str, Any]]) -> int:
         if not chunks:
             return 0
 
-        total = len(chunks)
-        inserted = 0
+        vectors = self.embedder.embed(chunk["chunk_text"] for chunk in chunks)
+        points: list[models.PointStruct] = []
+        for chunk, vector in zip(chunks, vectors, strict=False):
+            point_id = chunk.get("point_id") or str(uuid4())
+            chunk["point_id"] = point_id
+            points.append(models.PointStruct(id=point_id, vector=vector, payload=chunk))
 
-        for start in range(0, total, batch_size):
-            batch = chunks[start:start + batch_size]
-            vectors = self.embedder.embed(chunk["chunk_text"] for chunk in batch)
-
-            points: list[models.PointStruct] = []
-            for chunk, vector in zip(batch, vectors, strict=False):
-                point_id = chunk.get("point_id") or str(uuid4())
-                chunk["point_id"] = point_id
-                points.append(models.PointStruct(id=point_id, vector=vector, payload=chunk))
-
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=points,
-                wait=True,
-            )
-
-            inserted += len(points)
-
-            if progress_callback:
-                progress_callback(inserted, total, "Qdrant登録中")
-
+        self.client.upsert(collection_name=self.collection_name, points=points, wait=True)
         audit_logger.log(
             "qdrant_upsert",
             {
                 "collection": self.collection_name,
-                "points": inserted,
+                "points": len(points),
                 "mode": settings.qdrant_mode,
             },
         )
-        return inserted
+        return len(points)
 
     def search(self, query: str, tag_filters: dict[str, list[str]] | None = None, limit: int = 12) -> list[SearchHit]:
         vector = self.embedder.embed([query])[0]
@@ -149,6 +127,73 @@ class QdrantStore:
             return None
         return models.Filter(must=must_conditions)
 
+    def _document_filter(self, doc_name: str | None = None, doc_id: str | None = None) -> models.Filter:
+        must_conditions: list[models.Condition] = []
+
+        if doc_name:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="doc_name",
+                    match=models.MatchValue(value=doc_name),
+                )
+            )
+
+        if doc_id:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="doc_id",
+                    match=models.MatchValue(value=doc_id),
+                )
+            )
+
+        if not must_conditions:
+            raise ValueError("doc_name または doc_id の少なくとも一方が必要です。")
+
+        return models.Filter(must=must_conditions)
+
+    def count_document_points(self, doc_name: str | None = None, doc_id: str | None = None) -> int:
+        doc_filter = self._document_filter(doc_name=doc_name, doc_id=doc_id)
+        result = self.client.count(
+            collection_name=self.collection_name,
+            count_filter=doc_filter,
+            exact=True,
+        )
+        return int(getattr(result, "count", 0))
+
+    def delete_document(self, doc_name: str | None = None, doc_id: str | None = None) -> int:
+        doc_filter = self._document_filter(doc_name=doc_name, doc_id=doc_id)
+        count_before = self.count_document_points(doc_name=doc_name, doc_id=doc_id)
+
+        if count_before == 0:
+            audit_logger.log(
+                "document_delete_skipped",
+                {
+                    "collection": self.collection_name,
+                    "doc_name": doc_name,
+                    "doc_id": doc_id,
+                    "reason": "no_matching_points",
+                },
+            )
+            return 0
+
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=models.FilterSelector(filter=doc_filter),
+            wait=True,
+        )
+
+        audit_logger.log(
+            "document_deleted",
+            {
+                "collection": self.collection_name,
+                "doc_name": doc_name,
+                "doc_id": doc_id,
+                "deleted_points": count_before,
+                "mode": settings.qdrant_mode,
+            },
+        )
+        return count_before
+
     def mark_favorite(self, point_id: str) -> None:
         current = self.client.retrieve(
             collection_name=self.collection_name,
@@ -157,10 +202,8 @@ class QdrantStore:
         )
         if not current:
             return
-
         payload = dict(current[0].payload or {})
         current_weight = int(payload.get("favorite_weight", 0))
-
         self.client.set_payload(
             collection_name=self.collection_name,
             points=[point_id],
@@ -169,7 +212,6 @@ class QdrantStore:
                 "favorite_weight": current_weight + 1,
             },
         )
-
         audit_logger.log(
             "favorite_marked",
             {
