@@ -40,17 +40,50 @@ def _ingest_uploaded_pdf(store: QdrantStore, uploaded_pdf, parser_backend: str, 
     pdf_path = save_uploaded_pdf(uploaded_pdf, settings.temp_dir)
     st.session_state["pdf_path"] = pdf_path
     st.session_state["doc_name"] = uploaded_pdf.name
+
+    progress_bar = st.progress(0, text="0% | アップロード完了")
+    progress_note = st.empty()
+
+    def on_parse_progress(done: int, total: int, stage: str) -> None:
+        total = max(total, 1)
+        percent = min(80, int(done / total * 80))
+        progress_bar.progress(percent, text=f"{percent}% | {stage}")
+        progress_note.caption(f"解析進捗: {done}/{total} ページ")
+
+    def on_upsert_progress(done: int, total: int, stage: str) -> None:
+        total = max(total, 1)
+        percent = 80 + min(20, int(done / total * 20))
+        progress_bar.progress(percent, text=f"{percent}% | {stage}")
+        progress_note.caption(f"登録進捗: {done}/{total} チャンク")
+
     with st.status("PDFを解析してQdrantへ登録しています…", expanded=True) as status:
+        progress_bar.progress(5, text="5% | ファイル保存完了")
+
         chunks = build_chunks(
             pdf_path=pdf_path,
             doc_id=Path(pdf_path).stem,
             doc_name=uploaded_pdf.name,
             parser_backend=parser_backend,
             ocr_enabled=ocr_enabled,
+            progress_callback=on_parse_progress,
         )
+
         st.write(f"抽出チャンク数: {len(chunks)}")
-        inserted = store.upsert_chunks(chunks)
-        status.update(label=f"{uploaded_pdf.name} を解析し、{inserted}件のチャンクを登録しました。", state="complete")
+        progress_bar.progress(80, text="80% | 解析完了。Qdrantへ登録中")
+
+        inserted = store.upsert_chunks(
+            chunks,
+            batch_size=64,
+            progress_callback=on_upsert_progress,
+        )
+
+        progress_bar.progress(100, text="100% | 登録完了")
+        progress_note.caption(f"登録完了: {inserted} 件")
+
+        status.update(
+            label=f"{uploaded_pdf.name} を解析し、{inserted}件のチャンクを登録しました。",
+            state="complete",
+        )
 
 
 def _favorite_button(store: QdrantStore, result: dict) -> None:
@@ -71,7 +104,13 @@ def _render_pdf_panel() -> None:
             st.pdf(pdf_bytes)
         except Exception:
             st.info("この環境では埋め込みPDFビューアが使えないため、ハイライト済みPDFをダウンロード表示に切り替えています。")
-            st.download_button("ハイライト済みPDFをダウンロード", data=pdf_bytes, file_name="highlighted.pdf", mime="application/pdf", use_container_width=True)
+            st.download_button(
+                "ハイライト済みPDFをダウンロード",
+                data=pdf_bytes,
+                file_name="highlighted.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
     else:
         st.info("回答後に、該当ページを自動表示して根拠箇所をハイライトします。")
 
@@ -109,9 +148,10 @@ def main() -> None:
     store, retriever = get_services()
 
     st.sidebar.title("⚙️ PDFセットアップ")
-    parser_backend = st.sidebar.selectbox("解析バックエンド", ["hybrid", "pymupdf", "docling", "auto"], index=0)
+    parser_backend = st.sidebar.selectbox("解析バックエンド", ["hybrid", "pymupdf", "docling", "auto"], index=1)
     ocr_enabled = st.sidebar.toggle("OCRを有効化", value=settings.ocr_enabled)
     uploaded_pdf = st.sidebar.file_uploader("サービスハンドブックPDFをアップロード", type=["pdf"])
+
     if uploaded_pdf is not None:
         st.sidebar.write(f"選択中: {uploaded_pdf.name}")
         if st.sidebar.button("解析してQdrantへ登録", use_container_width=True):
@@ -120,6 +160,7 @@ def main() -> None:
         sample_pdf = Path(settings.local_pdf_dir) / "新202602_サービスハンドブック_技術料一覧表.pdf"
         if sample_pdf.exists():
             st.sidebar.success(f"サンプルPDF配置済み: {sample_pdf.name}")
+
     _render_audit_sidebar()
 
     col1, col2 = st.columns([1, 1])
@@ -132,6 +173,7 @@ def main() -> None:
         status_cols[0].metric("Qdrant", settings.qdrant_url)
         status_cols[1].metric("Parser", parser_backend)
         status_cols[2].metric("OCR", "ON" if ocr_enabled else "OFF")
+
         _render_demo_queries(retriever)
 
         for msg in st.session_state["messages"]:
@@ -142,6 +184,7 @@ def main() -> None:
         if not prompt and st.session_state.get("preset_prompt"):
             prompt = st.session_state["preset_prompt"]
             st.session_state["preset_prompt"] = ""
+
         if prompt:
             st.session_state["messages"].append({"role": "user", "content": prompt})
             with st.chat_message("user"):
@@ -150,6 +193,7 @@ def main() -> None:
             result = retriever.answer(prompt, doc_name=st.session_state.get("doc_name"))
             st.session_state["last_result"] = result
             top_hit = result.get("top_hit")
+
             if top_hit and top_hit.get("source_pdf_path"):
                 st.session_state["highlighted_pdf"] = build_highlighted_pdf_bytes(top_hit["source_pdf_path"], top_hit)
 
