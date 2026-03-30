@@ -39,12 +39,8 @@ def _inject_ui_styles() -> None:
         """
         <style>
         .block-container {
-            padding-top: 1.6rem;
+            padding-top: 1.5rem;
             padding-bottom: 1rem;
-        }
-
-        h1, h2, h3 {
-            letter-spacing: -0.01em;
         }
 
         .app-hero {
@@ -53,6 +49,12 @@ def _inject_ui_styles() -> None:
             border-radius: 18px;
             background: linear-gradient(180deg, rgba(30, 41, 59, 0.30), rgba(15, 23, 42, 0.10));
             margin-bottom: 0.95rem;
+        }
+
+        .helper-note {
+            color: #cbd5e1;
+            font-size: 0.92rem;
+            line-height: 1.65;
         }
 
         .status-card {
@@ -83,6 +85,14 @@ def _inject_ui_styles() -> None:
         .status-icon {
             font-size: 1.15rem;
             margin-right: 0.35rem;
+        }
+
+        .settings-note {
+            color: #cbd5e1;
+            font-size: 0.84rem;
+            margin-top: 0.1rem;
+            margin-bottom: 0.5rem;
+            line-height: 1.6;
         }
 
         div.stButton > button {
@@ -196,19 +206,6 @@ def _inject_ui_styles() -> None:
         .evidence-title {
             font-weight: 700;
             margin-bottom: 0.2rem;
-        }
-
-        .helper-note {
-            color: #cbd5e1;
-            font-size: 0.92rem;
-            line-height: 1.65;
-        }
-
-        .settings-help {
-            color: #cbd5e1;
-            font-size: 0.84rem;
-            margin-top: 0.1rem;
-            margin-bottom: 0.5rem;
         }
         </style>
         """,
@@ -353,7 +350,7 @@ def _favorite_button(store: QdrantStore, result: dict[str, Any]) -> None:
     if st.button("この回答を優先表示する", key=f"fav-{point_id}", use_container_width=True):
         try:
             store.mark_favorite(point_id)
-            st.toast("次回からこの回答を優先しやすくしました。")
+            st.toast("次回からこの回答を優先表示しやすくしました。")
         except Exception as exc:
             audit_logger.log("favorite_mark_failed", {"point_id": point_id, "error": str(exc)})
             st.warning("優先表示の保存に失敗しました。")
@@ -408,7 +405,7 @@ def _render_pdf_panel() -> None:
 
     if highlighted_pdf:
         pdf_bytes = highlighted_pdf
-        st.caption("参照箇所がある場合は、ハイライト表示します。")
+        st.caption("参照箇所がある場合はハイライト表示します。")
     elif pdf_path and Path(pdf_path).exists():
         try:
             pdf_bytes = Path(pdf_path).read_bytes()
@@ -554,12 +551,15 @@ def _render_settings_popover(default_backend: str, default_ocr_enabled: bool) ->
     with st.sidebar:
         if hasattr(st, "popover"):
             with st.popover("⚙️ 設定", use_container_width=True):
-                st.markdown('<div class="settings-help">必要なときだけ変更してください。</div>', unsafe_allow_html=True)
+                st.markdown(
+                    '<div class="settings-note">通常は変更不要です。分かる場合だけ操作してください。</div>',
+                    unsafe_allow_html=True,
+                )
                 parser_backend = st.selectbox(
                     "読取方式",
                     backends,
                     index=backends.index(selected_backend),
-                    help="通常は変更不要です。",
+                    help="通常は auto のままで問題ありません。",
                 )
                 ocr_enabled = st.toggle(
                     "画像内の文字も読む",
@@ -568,12 +568,15 @@ def _render_settings_popover(default_backend: str, default_ocr_enabled: bool) ->
                 )
         else:
             with st.expander("⚙️ 設定", expanded=False):
-                st.markdown('<div class="settings-help">必要なときだけ変更してください。</div>', unsafe_allow_html=True)
+                st.markdown(
+                    '<div class="settings-note">通常は変更不要です。分かる場合だけ操作してください。</div>',
+                    unsafe_allow_html=True,
+                )
                 parser_backend = st.selectbox(
                     "読取方式",
                     backends,
                     index=backends.index(selected_backend),
-                    help="通常は変更不要です。",
+                    help="通常は auto のままで問題ありません。",
                 )
                 ocr_enabled = st.toggle(
                     "画像内の文字も読む",
@@ -595,7 +598,7 @@ def _render_sidebar(store: QdrantStore) -> tuple[str, bool, Any]:
     )
 
     st.sidebar.markdown("### PDFを準備")
-    st.sidebar.caption("PDFを選んでから『読込開始』を押してください。")
+    st.sidebar.caption("まずPDFを選び、そのあと読込開始を押してください。")
 
     st.sidebar.markdown("**1. アップロード**")
 
@@ -611,8 +614,7 @@ def _render_sidebar(store: QdrantStore) -> tuple[str, bool, Any]:
             st.rerun()
     else:
         card_name = staged_name or current_doc_name or "PDFファイル"
-        card_label = "アップロードOK"
-        _render_status_card(card_label, card_name, icon="📎", muted=True)
+        _render_status_card("アップロードOK", card_name, icon="📎", muted=True)
 
     st.sidebar.markdown("**2. 読込**")
 
