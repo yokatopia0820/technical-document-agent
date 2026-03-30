@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -62,19 +63,23 @@ def _table_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, co
         matrix = table.extract() or []
         if len(matrix) < 2:
             continue
+
         headers = [normalize_text(v) for v in matrix[0]]
         for row_idx, row in enumerate(matrix[1:], start=1):
             row = [normalize_text(v) for v in row]
             if not any(row):
                 continue
+
             row_label = row[0] if row else f"row_{row_idx}"
             for col_idx in range(1, len(row)):
                 value = row[col_idx]
                 if not value:
                     continue
+
                 col_label = headers[col_idx] if col_idx < len(headers) else f"col_{col_idx}"
                 bbox = _get_cell_bbox(table, row_idx, col_idx) or [float(x) for x in table.bbox]
                 major_tag, medium_tag, minor_tag = tagger.derive_tags(context_text, row_label, col_label, value)
+
                 payload = {
                     "point_id": str(uuid4()),
                     "doc_id": doc_id,
@@ -97,6 +102,7 @@ def _table_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, co
                     "parser_backend": "pymupdf",
                     "shorthand_json": {row_label: {col_label: value}},
                 }
+
                 verification = verify_payload_against_pdf(pdf_path, payload)
                 payload["verified"] = verification["verified"]
                 payload["verification_summary"] = verification["verification_summary"]
@@ -105,7 +111,7 @@ def _table_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, co
                 payload["chunk_text"] = " | ".join(
                     [
                         context_text,
-                        f"ページ {page.number + 1}",
+                        f"{page.number + 1}",
                         row_label,
                         col_label,
                         payload["value"],
@@ -113,15 +119,18 @@ def _table_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, co
                     ]
                 )
                 chunks.append(payload)
+
     return chunks
 
 
 def _text_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, context_text: str, tagger: TaggingEngine) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
     data = page.get_text("dict")
+
     for block_index, block in enumerate(data.get("blocks", [])):
         if block.get("type") != 0:
             continue
+
         text = normalize_text(
             " ".join(
                 span.get("text", "")
@@ -131,7 +140,9 @@ def _text_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, con
         )
         if len(text) < 20:
             continue
+
         major_tag, medium_tag, minor_tag = tagger.derive_tags(context_text, text[:200])
+
         payload = {
             "point_id": str(uuid4()),
             "doc_id": doc_id,
@@ -153,18 +164,21 @@ def _text_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, con
             "verification_summary": "passes=[True, True, True]",
             "parser_backend": "pymupdf",
             "shorthand_json": {"text": text[:400]},
-            "chunk_text": " | ".join([context_text, f"ページ {page.number + 1}", text[:500]]),
+            "chunk_text": " | ".join([context_text, f"{page.number + 1}", text[:500]]),
         }
         chunks.append(payload)
+
     return chunks
 
 
 def _ocr_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, context_text: str, tagger: TaggingEngine) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
+
     for idx, block in enumerate(extract_ocr_blocks(page, lang=settings.ocr_langs)):
         text = normalize_text(block.get("text"))
         if len(text) < 2:
             continue
+
         major_tag, medium_tag, minor_tag = tagger.derive_tags(context_text, text)
         chunks.append(
             {
@@ -188,25 +202,41 @@ def _ocr_chunks(page: fitz.Page, pdf_path: str, doc_id: str, doc_name: str, cont
                 "verification_summary": f"ocr_conf={block.get('confidence', -1)}",
                 "parser_backend": "ocr_tesseract",
                 "shorthand_json": {"ocr_text": text},
-                "chunk_text": " | ".join([context_text, f"ページ {page.number + 1}", text]),
+                "chunk_text": " | ".join([context_text, f"{page.number + 1}", text]),
             }
         )
+
     return chunks
 
 
-def _build_pymupdf_chunks(pdf_path: str, doc_id: str, doc_name: str, ocr_enabled: bool) -> list[dict[str, Any]]:
+def _build_pymupdf_chunks(
+    pdf_path: str,
+    doc_id: str,
+    doc_name: str,
+    ocr_enabled: bool,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> list[dict[str, Any]]:
     doc = fitz.open(pdf_path)
     tagger = TaggingEngine()
+
     try:
         chunks: list[dict[str, Any]] = []
-        for page in doc:
+        total_pages = len(doc)
+
+        for idx, page in enumerate(doc, start=1):
             headings = _extract_headings(page)
             context_text = " | ".join(h["text"] for h in headings[:4])
             native_text = normalize_text(page.get_text("text"))
+
             chunks.extend(_table_chunks(page, pdf_path, doc_id, doc_name, context_text, tagger))
             chunks.extend(_text_chunks(page, pdf_path, doc_id, doc_name, context_text, tagger))
+
             if ocr_enabled and len(native_text) < settings.min_chars_for_native_text:
                 chunks.extend(_ocr_chunks(page, pdf_path, doc_id, doc_name, context_text, tagger))
+
+            if progress_callback:
+                progress_callback(idx, total_pages, f"PDF解析中 P.{idx}/{total_pages}")
+
         return chunks
     finally:
         doc.close()
@@ -218,6 +248,7 @@ def build_chunks(
     doc_name: str | None = None,
     parser_backend: str | None = None,
     ocr_enabled: bool | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> list[dict[str, Any]]:
     path = Path(pdf_path)
     doc_id = doc_id or path.stem
@@ -229,7 +260,15 @@ def build_chunks(
     used_backends: list[str] = []
 
     if parser_backend in {"pymupdf", "auto", "hybrid"}:
-        chunks.extend(_build_pymupdf_chunks(pdf_path, doc_id, doc_name, ocr_enabled=ocr_enabled))
+        chunks.extend(
+            _build_pymupdf_chunks(
+                pdf_path,
+                doc_id,
+                doc_name,
+                ocr_enabled=ocr_enabled,
+                progress_callback=progress_callback,
+            )
+        )
         used_backends.append("pymupdf")
 
     if parser_backend in {"docling", "hybrid"}:
