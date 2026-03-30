@@ -6,3 +6,4 @@ openai>=1.30.0
 requests>=2.32.0
 pillow>=10.4.0
 pytesseract>=0.3.13
+torchvision
