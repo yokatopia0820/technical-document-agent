@@ -1,3 +1,39 @@
+from __future__ import annotations
+
+import io
+from pathlib import Path
+from typing import Any
+
+import streamlit as st
+
+from core.audit import audit_logger
+from core.config import settings
+from core.embeddings import Embedder
+from core.llm import AnswerEngine
+from core.pdf_parser import build_chunks
+from core.pdf_utils import build_highlighted_pdf_bytes, save_uploaded_pdf
+from core.qdrant_store import QdrantStore
+from core.retriever import TechnicalRetriever
+
+
+class UploadedPDFBuffer(io.BytesIO):
+    def __init__(self, data: bytes, name: str) -> None:
+        super().__init__(data)
+        self.name = name
+        self.type = "application/pdf"
+
+    def getbuffer(self):
+        return memoryview(self.getvalue())
+
+
+@st.cache_resource
+def get_services() -> tuple[QdrantStore, TechnicalRetriever]:
+    embedder = Embedder()
+    store = QdrantStore(embedder)
+    retriever = TechnicalRetriever(store, AnswerEngine())
+    return store, retriever
+
+
 def _inject_ui_styles() -> None:
     st.markdown(
         """
@@ -8,19 +44,19 @@ def _inject_ui_styles() -> None:
             max-width: 1400px;
         }
 
-        h1, h2, h3 {
-            letter-spacing: -0.01em;
-            line-height: 1.18 !important;
-            margin-top: 0 !important;
-            padding-top: 0 !important;
-        }
-
         [data-testid="stHorizontalBlock"] {
             align-items: stretch;
         }
 
         [data-testid="column"] > div {
             padding-top: 0.35rem;
+        }
+
+        h1, h2, h3 {
+            letter-spacing: -0.01em;
+            line-height: 1.18 !important;
+            margin-top: 0 !important;
+            padding-top: 0 !important;
         }
 
         .app-hero {
@@ -148,15 +184,24 @@ def _inject_ui_styles() -> None:
             outline: none !important;
         }
 
+        section[data-testid="stFileUploader"] {
+            margin-top: 0.25rem;
+        }
+
         section[data-testid="stFileUploader"] small {
             display: none !important;
         }
 
-        section[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"] > div {
+        section[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"] {
+            position: relative;
+            min-height: 56px;
+        }
+
+        section[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"] > * {
             display: none !important;
         }
 
-        section[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"]::after {
+        section[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"]::before {
             content: "PDFファイルをアップロードしてください";
             display: block;
             text-align: center;
@@ -164,6 +209,14 @@ def _inject_ui_styles() -> None:
             font-size: 1rem;
             color: #e5e7eb;
             margin-bottom: 0.25rem;
+        }
+
+        section[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"]::after {
+            content: "PDFのみ・1GBまで";
+            display: block;
+            text-align: center;
+            font-size: 0.85rem;
+            color: #94a3b8;
         }
 
         section[data-testid="stFileUploader"] button {
@@ -185,14 +238,4 @@ def _inject_ui_styles() -> None:
             border-radius: 14px;
             padding: 0.8rem 0.9rem;
             margin-bottom: 0.65rem;
-            background: rgba(15, 23, 42, 0.24);
-        }
-
-        .evidence-title {
-            font-weight: 700;
-            margin-bottom: 0.2rem;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+            background: rgba(15, 23, 42, 0<span class="cursor">█</span>
