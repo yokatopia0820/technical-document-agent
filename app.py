@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import json
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +39,8 @@ def _inject_ui_styles() -> None:
         """
         <style>
         .block-container {
-            padding-top: 1.2rem;
+            padding-top: 1.6rem;
+            padding-bottom: 1rem;
         }
 
         h1, h2, h3 {
@@ -48,24 +48,24 @@ def _inject_ui_styles() -> None:
         }
 
         .app-hero {
-            padding: 1.05rem 1.15rem 1rem 1.15rem;
-            border: 1px solid rgba(148, 163, 184, 0.18);
-            border-radius: 16px;
-            background: linear-gradient(180deg, rgba(30, 41, 59, 0.34), rgba(15, 23, 42, 0.12));
-            margin-bottom: 0.9rem;
+            padding: 1.1rem 1.15rem 1rem 1.15rem;
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            border-radius: 18px;
+            background: linear-gradient(180deg, rgba(30, 41, 59, 0.30), rgba(15, 23, 42, 0.10));
+            margin-bottom: 0.95rem;
         }
 
         .status-card {
-            border: 1px solid rgba(148, 163, 184, 0.22);
+            border: 1px solid rgba(148, 163, 184, 0.20);
             border-radius: 16px;
             padding: 0.95rem 1rem;
             margin: 0.2rem 0 0.8rem 0;
-            background: rgba(15, 23, 42, 0.34);
+            background: rgba(15, 23, 42, 0.30);
         }
 
         .status-card.is-muted {
             opacity: 0.72;
-            filter: grayscale(0.15);
+            filter: grayscale(0.18);
         }
 
         .status-title {
@@ -75,7 +75,7 @@ def _inject_ui_styles() -> None:
         }
 
         .status-sub {
-            font-size: 0.85rem;
+            font-size: 0.86rem;
             color: #cbd5e1;
             word-break: break-word;
         }
@@ -86,15 +86,50 @@ def _inject_ui_styles() -> None:
         }
 
         div.stButton > button {
-            border-radius: 12px;
+            border-radius: 12px !important;
             min-height: 2.75rem;
             font-weight: 700;
             transition: all 0.15s ease;
+            outline: none !important;
+            box-shadow: none !important;
         }
 
         div.stButton > button:hover:not(:disabled) {
             transform: translateY(-1px);
-            border-color: rgba(96, 165, 250, 0.9);
+            outline: none !important;
+            box-shadow: none !important;
+        }
+
+        div.stButton > button:focus,
+        div.stButton > button:focus-visible,
+        div.stButton > button:active {
+            outline: none !important;
+            box-shadow: none !important;
+        }
+
+        div.stButton > button[kind="primary"] {
+            background: #ff5a5f !important;
+            color: #ffffff !important;
+            border: 1px solid #ff5a5f !important;
+            outline: none !important;
+            box-shadow: none !important;
+        }
+
+        div.stButton > button[kind="primary"]:hover:not(:disabled) {
+            background: #ff474d !important;
+            border: 1px solid #ff474d !important;
+            color: #ffffff !important;
+            outline: none !important;
+            box-shadow: none !important;
+        }
+
+        div.stButton > button[kind="primary"]:focus,
+        div.stButton > button[kind="primary"]:focus-visible,
+        div.stButton > button[kind="primary"]:active {
+            background: #ff5a5f !important;
+            border: 1px solid #ff5a5f !important;
+            outline: none !important;
+            box-shadow: none !important;
         }
 
         div.stButton > button:disabled {
@@ -103,11 +138,14 @@ def _inject_ui_styles() -> None:
             transform: none !important;
             border-color: rgba(148, 163, 184, 0.18) !important;
             box-shadow: none !important;
+            outline: none !important;
         }
 
         div.stButton > button:disabled:hover {
             transform: none !important;
             border-color: rgba(148, 163, 184, 0.18) !important;
+            box-shadow: none !important;
+            outline: none !important;
         }
 
         section[data-testid="stFileUploader"] small {
@@ -157,7 +195,15 @@ def _inject_ui_styles() -> None:
 
         .helper-note {
             color: #cbd5e1;
-            font-size: 0.9rem;
+            font-size: 0.92rem;
+            line-height: 1.65;
+        }
+
+        .settings-help {
+            color: #cbd5e1;
+            font-size: 0.84rem;
+            margin-top: 0.1rem;
+            margin-bottom: 0.5rem;
         }
         </style>
         """,
@@ -350,7 +396,7 @@ def _render_pdf_panel() -> None:
 
     if highlighted_pdf:
         pdf_bytes = highlighted_pdf
-        st.caption("AIが参照した箇所がある場合は、ハイライト表示します。")
+        st.caption("参照箇所がある場合は、ハイライト表示します。")
     elif pdf_path and Path(pdf_path).exists():
         try:
             pdf_bytes = Path(pdf_path).read_bytes()
@@ -381,14 +427,19 @@ def _render_pdf_panel() -> None:
             st.write(f"内容: {top_hit.get('value')}")
 
 
-def _render_demo_queries(retriever: TechnicalRetriever, disabled: bool) -> None:
-    demo_queries = retriever.tagger.demo_queries()
-    if not demo_queries:
-        return
+def _render_demo_queries(disabled: bool) -> None:
+    demo_queries = [
+        "このPDFの要点を3つで教えてください",
+        "重要な注意点を教えてください",
+        "手順があれば順番に教えてください",
+        "期限や条件に関する記載を探してください",
+        "費用や料金に関する記載を探してください",
+        "問い合わせ先や連絡先があれば教えてください",
+    ]
 
     st.markdown("**質問例**")
     cols = st.columns(2)
-    for idx, query in enumerate(demo_queries[:6]):
+    for idx, query in enumerate(demo_queries):
         with cols[idx % 2]:
             if st.button(query, key=f"demo-{idx}", use_container_width=True, disabled=disabled):
                 st.session_state["preset_prompt"] = query
@@ -466,29 +517,58 @@ def _ingest_uploaded_pdf(store: QdrantStore, uploaded_pdf, parser_backend: str, 
         st.session_state["is_processing"] = False
 
 
+def _render_settings_popover(default_backend: str, default_ocr_enabled: bool) -> tuple[str, bool]:
+    parser_backend = default_backend
+    ocr_enabled = default_ocr_enabled
+
+    backends = ["auto", "pymupdf", "hybrid", "docling"]
+    selected_backend = default_backend if default_backend in backends else "auto"
+
+    with st.sidebar:
+        if hasattr(st, "popover"):
+            with st.popover("⚙️ 設定", use_container_width=True):
+                st.markdown('<div class="settings-help">必要なときだけ変更してください。</div>', unsafe_allow_html=True)
+                parser_backend = st.selectbox(
+                    "読取方式",
+                    backends,
+                    index=backends.index(selected_backend),
+                    help="通常は変更不要です。",
+                )
+                ocr_enabled = st.toggle(
+                    "画像内の文字も読む",
+                    value=default_ocr_enabled,
+                    help="スキャンPDFや画像文字が含まれる場合に使います。",
+                )
+        else:
+            with st.expander("⚙️ 設定", expanded=False):
+                st.markdown('<div class="settings-help">必要なときだけ変更してください。</div>', unsafe_allow_html=True)
+                parser_backend = st.selectbox(
+                    "読取方式",
+                    backends,
+                    index=backends.index(selected_backend),
+                    help="通常は変更不要です。",
+                )
+                ocr_enabled = st.toggle(
+                    "画像内の文字も読む",
+                    value=default_ocr_enabled,
+                    help="スキャンPDFや画像文字が含まれる場合に使います。",
+                )
+
+    return parser_backend, ocr_enabled
+
+
 def _render_sidebar(store: QdrantStore) -> tuple[str, bool]:
     staged_name = st.session_state.get("uploaded_pdf_name")
     current_doc_name = st.session_state.get("doc_name")
     is_processing = bool(st.session_state.get("is_processing"))
 
-    parser_backend = settings.parser_backend
-    ocr_enabled = settings.ocr_enabled
+    parser_backend, ocr_enabled = _render_settings_popover(
+        default_backend=settings.parser_backend,
+        default_ocr_enabled=settings.ocr_enabled,
+    )
 
-    st.sidebar.subheader("PDFを準備")
+    st.sidebar.markdown("### PDFを準備")
     st.sidebar.caption("PDFを選んでから『読込開始』を押してください。")
-
-    with st.sidebar.expander("詳細設定（上級者向け）", expanded=False):
-        parser_backend = st.selectbox(
-            "読取方式",
-            ["auto", "pymupdf", "hybrid", "docling"],
-            index=["auto", "pymupdf", "hybrid", "docling"].index("pymupdf" if settings.parser_backend == "pymupdf" else "auto"),
-            help="通常は変更不要です。",
-        )
-        ocr_enabled = st.toggle(
-            "画像内の文字も読む",
-            value=settings.ocr_enabled,
-            help="スキャンPDFや画像文字が含まれる場合に有効です。通常はONのままで問題ありません。",
-        )
 
     st.sidebar.markdown("**1. アップロード**")
 
@@ -512,7 +592,7 @@ def _render_sidebar(store: QdrantStore) -> tuple[str, bool]:
     can_start = bool(staged_name) and not is_processing and not current_doc_name
     start_help = None
     if current_doc_name:
-        start_help = "すでに読み込み済みです。別のPDFに差し替える場合は下のボタンを使ってください。"
+        start_help = "すでに読み込み済みです。差し替える場合は下のボタンを使ってください。"
     elif not staged_name:
         start_help = "先にPDFをアップロードしてください。"
 
@@ -528,7 +608,7 @@ def _render_sidebar(store: QdrantStore) -> tuple[str, bool]:
             st.rerun()
 
     if is_processing:
-        _render_status_card("読込中", "この間は他の操作ができません。完了までそのままお待ちください。", icon="⏳")
+        _render_status_card("読込中", "この間は他の操作はできません。完了までそのままお待ちください。", icon="⏳")
 
     st.sidebar.divider()
     st.sidebar.markdown("**現在のPDF**")
@@ -542,7 +622,6 @@ def _render_sidebar(store: QdrantStore) -> tuple[str, bool]:
         with col2:
             if st.button("削除する", use_container_width=True, disabled=is_processing):
                 _delete_current_pdf(store)
-        st.sidebar.caption("データも消したい場合は『削除する』を使ってください。")
     elif staged_name and not is_processing:
         _render_status_card("アップロードOK", staged_name, icon="📎", muted=True)
         if st.sidebar.button("選び直す", use_container_width=True):
@@ -555,14 +634,14 @@ def _render_sidebar(store: QdrantStore) -> tuple[str, bool]:
 
 
 def main() -> None:
-    st.set_page_config(page_title="PDFに質問", layout="wide")
+    st.set_page_config(page_title="PDFに質問", page_icon="📄", layout="wide")
     _inject_ui_styles()
     _init_state()
 
-    store, retriever = get_services()
+    store, _ = get_services()
     _render_sidebar(store)
 
-    col1, col2 = st.columns([1.02, 0.98])
+    col1, col2 = st.columns([1.02, 0.98], gap="large")
 
     with col1:
         st.markdown(
@@ -570,7 +649,7 @@ def main() -> None:
             <div class="app-hero">
                 <h1 style="margin:0 0 0.35rem 0;">PDFに質問</h1>
                 <div class="helper-note">
-                    PDFを読み込むと、料金・保証・型番などを質問できます。<br>
+                    PDFを読み込むと、内容について質問できます。<br>
                     回答には、参照したページや該当箇所もあわせて表示します。
                 </div>
             </div>
@@ -586,7 +665,7 @@ def main() -> None:
         else:
             st.info("左側でPDFをアップロードして『読込開始』を押してください。")
 
-        _render_demo_queries(retriever, disabled=(not current_doc_name or is_processing))
+        _render_demo_queries(disabled=(not current_doc_name or is_processing))
 
         for msg in st.session_state["messages"]:
             with st.chat_message(msg["role"]):
@@ -611,6 +690,7 @@ def main() -> None:
                 st.write(prompt)
 
             try:
+                _, retriever = get_services()
                 result = retriever.answer(prompt, doc_name=st.session_state.get("doc_name"))
                 st.session_state["last_result"] = result
 
