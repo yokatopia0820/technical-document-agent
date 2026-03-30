@@ -51,16 +51,45 @@ def _ingest_uploaded_pdf(store: QdrantStore, uploaded_pdf, parser_backend: str, 
     st.session_state["pdf_path"] = pdf_path
     st.session_state["doc_name"] = uploaded_pdf.name
 
+    progress_bar = st.progress(0, text="0% | アップロード完了")
+    progress_note = st.empty()
+
+    def on_parse_progress(done: int, total: int, stage: str) -> None:
+        total = max(total, 1)
+        percent = min(80, int(done / total * 80))
+        progress_bar.progress(percent, text=f"{percent}% | {stage}")
+        progress_note.caption(f"解析進捗: {done}/{total} ページ")
+
+    def on_upsert_progress(done: int, total: int, stage: str) -> None:
+        total = max(total, 1)
+        percent = 80 + min(20, int(done / total * 20))
+        progress_bar.progress(percent, text=f"{percent}% | {stage}")
+        progress_note.caption(f"登録進捗: {done}/{total} チャンク")
+
     with st.status("PDFを解析してQdrantへ登録しています…", expanded=True) as status:
+        progress_bar.progress(5, text="5% | ファイル保存完了")
+
         chunks = build_chunks(
             pdf_path=pdf_path,
             doc_id=Path(pdf_path).stem,
             doc_name=uploaded_pdf.name,
             parser_backend=parser_backend,
             ocr_enabled=ocr_enabled,
+            progress_callback=on_parse_progress,
         )
+
         st.write(f"抽出チャンク数: {len(chunks)}")
-        inserted = store.upsert_chunks(chunks)
+        progress_bar.progress(80, text="80% | 解析完了。Qdrantへ登録中")
+
+        inserted = store.upsert_chunks(
+            chunks,
+            batch_size=64,
+            progress_callback=on_upsert_progress,
+        )
+
+        progress_bar.progress(100, text="100% | 登録完了")
+        progress_note.caption(f"登録完了: {inserted} 件")
+
         status.update(
             label=f"{uploaded_pdf.name} を解析し、{inserted}件のチャンクを登録しました。",
             state="complete",
@@ -201,7 +230,7 @@ def main() -> None:
     store, retriever = get_services()
 
     st.sidebar.title("⚙️ PDFセットアップ")
-    parser_backend = st.sidebar.selectbox("解析バックエンド", ["hybrid", "pymupdf", "docling", "auto"], index=0)
+    parser_backend = st.sidebar.selectbox("解析バックエンド", ["hybrid", "pymupdf", "docling", "auto"], index=1)
     ocr_enabled = st.sidebar.toggle("OCRを有効化", value=settings.ocr_enabled)
     uploaded_pdf = st.sidebar.file_uploader("サービスハンドブックPDFをアップロード", type=["pdf"])
 
