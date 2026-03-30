@@ -36,54 +36,78 @@ def _init_state() -> None:
         st.session_state.setdefault(key, value)
 
 
+def _reset_document_state(clear_messages: bool = False) -> None:
+    st.session_state["pdf_path"] = None
+    st.session_state["doc_name"] = None
+    st.session_state["last_result"] = None
+    st.session_state["highlighted_pdf"] = None
+    st.session_state["preset_prompt"] = ""
+    if clear_messages:
+        st.session_state["messages"] = []
+
+
 def _ingest_uploaded_pdf(store: QdrantStore, uploaded_pdf, parser_backend: str, ocr_enabled: bool) -> None:
     pdf_path = save_uploaded_pdf(uploaded_pdf, settings.temp_dir)
     st.session_state["pdf_path"] = pdf_path
     st.session_state["doc_name"] = uploaded_pdf.name
 
-    progress_bar = st.progress(0, text="0% | アップロード完了")
-    progress_note = st.empty()
-
-    def on_parse_progress(done: int, total: int, stage: str) -> None:
-        total = max(total, 1)
-        percent = min(80, int(done / total * 80))
-        progress_bar.progress(percent, text=f"{percent}% | {stage}")
-        progress_note.caption(f"解析進捗: {done}/{total} ページ")
-
-    def on_upsert_progress(done: int, total: int, stage: str) -> None:
-        total = max(total, 1)
-        percent = 80 + min(20, int(done / total * 20))
-        progress_bar.progress(percent, text=f"{percent}% | {stage}")
-        progress_note.caption(f"登録進捗: {done}/{total} チャンク")
-
     with st.status("PDFを解析してQdrantへ登録しています…", expanded=True) as status:
-        progress_bar.progress(5, text="5% | ファイル保存完了")
-
         chunks = build_chunks(
             pdf_path=pdf_path,
             doc_id=Path(pdf_path).stem,
             doc_name=uploaded_pdf.name,
             parser_backend=parser_backend,
             ocr_enabled=ocr_enabled,
-            progress_callback=on_parse_progress,
         )
-
         st.write(f"抽出チャンク数: {len(chunks)}")
-        progress_bar.progress(80, text="80% | 解析完了。Qdrantへ登録中")
-
-        inserted = store.upsert_chunks(
-            chunks,
-            batch_size=64,
-            progress_callback=on_upsert_progress,
-        )
-
-        progress_bar.progress(100, text="100% | 登録完了")
-        progress_note.caption(f"登録完了: {inserted} 件")
-
+        inserted = store.upsert_chunks(chunks)
         status.update(
             label=f"{uploaded_pdf.name} を解析し、{inserted}件のチャンクを登録しました。",
             state="complete",
         )
+
+
+def _clear_current_pdf_ui() -> None:
+    _reset_document_state(clear_messages=False)
+    st.toast("現在のPDF表示状態をクリアしました。")
+    st.rerun()
+
+
+def _delete_current_pdf(store: QdrantStore) -> None:
+    pdf_path = st.session_state.get("pdf_path")
+    doc_name = st.session_state.get("doc_name")
+    doc_id = Path(pdf_path).stem if pdf_path else None
+
+    if not doc_name and not doc_id:
+        st.warning("削除対象のPDFが見つかりません。")
+        return
+
+    deleted_points = store.delete_document(doc_name=doc_name, doc_id=doc_id)
+
+    file_deleted = False
+    if pdf_path:
+        try:
+            path_obj = Path(pdf_path)
+            if path_obj.exists():
+                path_obj.unlink()
+                file_deleted = True
+        except Exception:
+            file_deleted = False
+
+    audit_logger.log(
+        "pdf_deleted_from_ui",
+        {
+            "doc_name": doc_name,
+            "doc_id": doc_id,
+            "pdf_path": pdf_path,
+            "deleted_points": deleted_points,
+            "file_deleted": file_deleted,
+        },
+    )
+
+    _reset_document_state(clear_messages=False)
+    st.toast(f"PDFを削除しました（Qdrant削除対象: {deleted_points}件）。")
+    st.rerun()
 
 
 def _favorite_button(store: QdrantStore, result: dict) -> None:
@@ -142,13 +166,42 @@ def _render_demo_queries(retriever: TechnicalRetriever) -> None:
                 st.session_state["preset_prompt"] = query
 
 
+def _render_document_management(store: QdrantStore) -> None:
+    st.sidebar.divider()
+    st.sidebar.subheader("🗂 現在のPDF")
+
+    current_doc_name = st.session_state.get("doc_name")
+    current_pdf_path = st.session_state.get("pdf_path")
+
+    if current_doc_name:
+        st.sidebar.success(f"セット中: {current_doc_name}")
+    else:
+        st.sidebar.info("現在セット中のPDFはありません。")
+
+    if current_pdf_path:
+        st.sidebar.caption(f"保存先: {current_pdf_path}")
+
+    clear_col, delete_col = st.sidebar.columns(2)
+
+    with clear_col:
+        if st.button("クリア", use_container_width=True, disabled=not current_doc_name):
+            _clear_current_pdf_ui()
+
+    with delete_col:
+        if st.button("完全削除", use_container_width=True, disabled=not current_doc_name, type="secondary"):
+            _delete_current_pdf(store)
+
+    if current_doc_name:
+        st.sidebar.caption("「完全削除」はQdrant内データと一時PDFファイルを削除します。")
+
+
 def main() -> None:
     st.set_page_config(page_title="技術資料AI", layout="wide")
     _init_state()
     store, retriever = get_services()
 
     st.sidebar.title("⚙️ PDFセットアップ")
-    parser_backend = st.sidebar.selectbox("解析バックエンド", ["hybrid", "pymupdf", "docling", "auto"], index=1)
+    parser_backend = st.sidebar.selectbox("解析バックエンド", ["hybrid", "pymupdf", "docling", "auto"], index=0)
     ocr_enabled = st.sidebar.toggle("OCRを有効化", value=settings.ocr_enabled)
     uploaded_pdf = st.sidebar.file_uploader("サービスハンドブックPDFをアップロード", type=["pdf"])
 
@@ -161,6 +214,7 @@ def main() -> None:
         if sample_pdf.exists():
             st.sidebar.success(f"サンプルPDF配置済み: {sample_pdf.name}")
 
+    _render_document_management(store)
     _render_audit_sidebar()
 
     col1, col2 = st.columns([1, 1])
@@ -173,7 +227,6 @@ def main() -> None:
         status_cols[0].metric("Qdrant", settings.qdrant_url)
         status_cols[1].metric("Parser", parser_backend)
         status_cols[2].metric("OCR", "ON" if ocr_enabled else "OFF")
-
         _render_demo_queries(retriever)
 
         for msg in st.session_state["messages"]:
@@ -193,7 +246,6 @@ def main() -> None:
             result = retriever.answer(prompt, doc_name=st.session_state.get("doc_name"))
             st.session_state["last_result"] = result
             top_hit = result.get("top_hit")
-
             if top_hit and top_hit.get("source_pdf_path"):
                 st.session_state["highlighted_pdf"] = build_highlighted_pdf_bytes(top_hit["source_pdf_path"], top_hit)
 
